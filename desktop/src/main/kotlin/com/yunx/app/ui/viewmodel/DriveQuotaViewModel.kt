@@ -1,0 +1,201 @@
+package com.yunx.app.ui.viewmodel
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.CreationExtras
+import kotlin.reflect.KClass
+import com.yunx.app.data.network.BaiduApi
+import com.yunx.app.data.network.C139Api
+import com.yunx.app.data.network.Pan115Api
+import com.yunx.app.data.db.GuangYaAccountEntity
+import com.yunx.app.data.db.ILanzouAccountEntity
+import com.yunx.app.data.network.GuangYaApi
+import com.yunx.app.data.network.GuangYaDevice
+import com.yunx.app.data.network.ILanzouApi
+import com.yunx.app.data.network.Pan123Api
+import com.yunx.app.data.network.QuarkApi
+import com.yunx.app.data.network.UCApi
+import com.yunx.app.data.network.XunleiApi
+import com.yunx.app.data.network.model.QuotaInfo
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+
+/**
+ * 网盘空间详情 ViewModel：并发加载 5 个平台的容量使用情况（仅已登录平台请求）。
+ * 网盘页顶部「空间总览」展示用。
+ */
+class DriveQuotaViewModel(
+    private val quarkApi: QuarkApi,
+    private val quarkCookie: suspend () -> String?,
+    private val ucApi: UCApi,
+    private val ucCookie: suspend () -> String?,
+    private val xunleiApi: XunleiApi,
+    private val xunleiToken: suspend () -> String?,
+    private val xunleiDeviceId: suspend () -> String?,
+    private val xunleiCaptcha: suspend () -> String?,
+    private val baiduApi: BaiduApi,
+    private val baiduCookie: suspend () -> String?,
+    private val c139Api: C139Api,
+    private val c139Cookie: suspend () -> String?,
+    private val pan123Api: Pan123Api,
+    private val pan123Token: suspend () -> String?,
+    private val pan115Api: Pan115Api,
+    private val pan115Cookie: suspend () -> String?,
+    private val guangyaApi: GuangYaApi,
+    private val guangyaAccount: suspend () -> GuangYaAccountEntity?,
+    private val ilanzouApi: ILanzouApi,
+    private val ilanzouAccount: suspend () -> ILanzouAccountEntity?
+) : ViewModel() {
+
+    private val _quarkQuota = MutableStateFlow<QuotaInfo?>(null)
+    val quarkQuota: StateFlow<QuotaInfo?> = _quarkQuota.asStateFlow()
+
+    private val _ucQuota = MutableStateFlow<QuotaInfo?>(null)
+    val ucQuota: StateFlow<QuotaInfo?> = _ucQuota.asStateFlow()
+
+    private val _xunleiQuota = MutableStateFlow<QuotaInfo?>(null)
+    val xunleiQuota: StateFlow<QuotaInfo?> = _xunleiQuota.asStateFlow()
+
+    private val _baiduQuota = MutableStateFlow<QuotaInfo?>(null)
+    val baiduQuota: StateFlow<QuotaInfo?> = _baiduQuota.asStateFlow()
+
+    private val _c139Quota = MutableStateFlow<QuotaInfo?>(null)
+    val c139Quota: StateFlow<QuotaInfo?> = _c139Quota.asStateFlow()
+
+    private val _pan123Quota = MutableStateFlow<QuotaInfo?>(null)
+    val pan123Quota: StateFlow<QuotaInfo?> = _pan123Quota.asStateFlow()
+
+    private val _pan115Quota = MutableStateFlow<QuotaInfo?>(null)
+    val pan115Quota: StateFlow<QuotaInfo?> = _pan115Quota.asStateFlow()
+
+    private val _guangyaQuota = MutableStateFlow<QuotaInfo?>(null)
+    val guangyaQuota: StateFlow<QuotaInfo?> = _guangyaQuota.asStateFlow()
+
+    private val _ilanzouQuota = MutableStateFlow<QuotaInfo?>(null)
+    val ilanzouQuota: StateFlow<QuotaInfo?> = _ilanzouQuota.asStateFlow()
+
+    /** 是否加载中 */
+    val loading = MutableStateFlow(false)
+
+    /** 并发加载全部已登录平台的空间（各平台独立请求，互不阻塞；未登录平台自动跳过） */
+    fun loadAll() {
+        if (loading.value) return // 防止下拉刷新与进入页面初始化重复触发
+        loading.value = true
+        viewModelScope.launch {
+            coroutineScope {
+                // 夸克
+                launch {
+                    val qc = quarkCookie()
+                    if (qc != null) {
+                        _quarkQuota.value = runCatching { quarkApi.getQuota(qc) }.getOrNull()
+                    }
+                }
+                // UC
+                launch {
+                    val uc = ucCookie()
+                    if (uc != null) {
+                        _ucQuota.value = runCatching { ucApi.getQuota(uc) }.getOrNull()
+                    }
+                }
+                // 迅雷
+                launch {
+                    val xl = xunleiToken()
+                    if (xl != null) {
+                        val deviceId = xunleiDeviceId() ?: ""
+                        val captcha = xunleiCaptcha() ?: ""
+                        _xunleiQuota.value = runCatching { xunleiApi.getQuota(xl, deviceId, captcha) }.getOrNull()
+                    }
+                }
+                // 百度
+                launch {
+                    val bd = baiduCookie()
+                    if (bd != null) {
+                        _baiduQuota.value = runCatching { baiduApi.getQuota(bd) }.getOrNull()
+                    }
+                }
+                // 139
+                launch {
+                    val c139 = c139Cookie()
+                    if (c139 != null) {
+                        _c139Quota.value = runCatching { c139Api.getQuota(c139) }.getOrNull()
+                    }
+                }
+                // 123
+                launch {
+                    val p123 = pan123Token()
+                    if (p123 != null) {
+                        _pan123Quota.value = runCatching { pan123Api.getQuota(p123) }.getOrNull()
+                    }
+                }
+                // 115
+                launch {
+                    val p115 = pan115Cookie()
+                    if (p115 != null) {
+                        _pan115Quota.value = runCatching { pan115Api.getQuota(p115) }.getOrNull()
+                    }
+                }
+                // 光鸭（配额接口同时需要 accessToken 与设备标识）
+                launch {
+                    val gy = guangyaAccount()
+                    if (gy != null && gy.accessToken.isNotBlank()) {
+                        _guangyaQuota.value = runCatching {
+                            guangyaApi.getQuota(gy.accessToken, GuangYaDevice(gy.deviceId, gy.deviceSign))
+                        }.getOrNull()
+                    }
+                }
+                // 蓝奏云优享版
+                launch {
+                    val il = ilanzouAccount()
+                    if (il != null && il.appToken.isNotBlank()) {
+                        _ilanzouQuota.value = runCatching {
+                            ilanzouApi.getQuota(il.appToken, il.uuid)
+                        }.getOrNull()
+                    }
+                }
+                // 蓝奏云：官方无配额接口，不提供用量展示
+            }
+            loading.value = false
+        }
+    }
+
+    class Factory(
+        private val quarkApi: QuarkApi,
+        private val quarkCookie: suspend () -> String?,
+        private val ucApi: UCApi,
+        private val ucCookie: suspend () -> String?,
+        private val xunleiApi: XunleiApi,
+        private val xunleiToken: suspend () -> String?,
+        private val xunleiDeviceId: suspend () -> String?,
+        private val xunleiCaptcha: suspend () -> String?,
+        private val baiduApi: BaiduApi,
+        private val baiduCookie: suspend () -> String?,
+        private val c139Api: C139Api,
+        private val c139Cookie: suspend () -> String?,
+        private val pan123Api: Pan123Api,
+        private val pan123Token: suspend () -> String?,
+        private val pan115Api: Pan115Api,
+        private val pan115Cookie: suspend () -> String?,
+        private val guangyaApi: GuangYaApi,
+        private val guangyaAccount: suspend () -> GuangYaAccountEntity?,
+        private val ilanzouApi: ILanzouApi,
+        private val ilanzouAccount: suspend () -> ILanzouAccountEntity?
+    ) : ViewModelProvider.Factory {
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : ViewModel> create(modelClass: KClass<T>, extras: CreationExtras): T =
+            DriveQuotaViewModel(
+                quarkApi, quarkCookie,
+                ucApi, ucCookie,
+                xunleiApi, xunleiToken, xunleiDeviceId, xunleiCaptcha,
+                baiduApi, baiduCookie,
+                c139Api, c139Cookie,
+                pan123Api, pan123Token,
+                pan115Api, pan115Cookie,
+                guangyaApi, guangyaAccount,
+                ilanzouApi, ilanzouAccount
+            ) as T
+    }
+}

@@ -1,0 +1,81 @@
+name: PR 便携包构建
+
+# 目的：任何 PR（含 fork）提交后自动构建免安装便携包并作为 artifact 上传，
+# 维护者不必本地拉取代码即可下载 zip 直接试运行。不构建 Inno Setup 安装程序。
+#
+# 构建流程完全复用仓库里的 portable-package.ps1（JDK 定位 / Gradle wrapper / jlink / jpackage
+# / 自研启动器 / jar 裁剪 / JCEF 语言包裁剪 走同一套逻辑），保证 CI 产物与本地打包一致。
+#
+# 注意：来自首次贡献者的 PR，GitHub 默认需要仓库维护者点一次 “Approve and run workflows”。
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-portable-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  portable:
+    name: 构建免安装便携包
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # Temurin 17 自带 jpackage；portable-package.ps1 的 Ensure-Jdk 会通过 JAVA_HOME 找到它
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 缓存 Gradle 发行版与依赖，冷启动可省 2~3 分钟
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'gradle.properties', '**/*.gradle.kts') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # 编译 Kotlin + darkmode.dll（MSVC，runner 已预装 VS2022）+ jar 裁剪 + JCEF 语言包裁剪 +
+      # jlink 运行时 + jpackage app-image + 自研启动器
+      - name: 构建便携包
+        shell: powershell
+        run: .\portable-package.ps1
+
+      - name: 打包为 zip
+        shell: powershell
+        run: |
+          $name = "YunX-Desktop-portable-${{ github.event.pull_request.number || github.run_number }}"
+          # 进入 release 目录再打包，使 zip 根目录直接是 YunX-Desktop\（解开即可双击 exe）
+          Push-Location .\release
+          try {
+            & 7z a -tzip -mx=5 "..\$name.zip" "YunX-Desktop" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "7z 打包失败" }
+          } finally {
+            Pop-Location
+          }
+          $mb = [math]::Round((Get-Item "$name.zip").Length / 1MB, 1)
+          Write-Host "artifact: $name.zip ($mb MB)"
+          # 用无 BOM 的 UTF-8 追加，避免 GITHUB_STEP_SUMMARY 首行出现 BOM 乱码
+          [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, "### 便携包已生成：$name.zip（$mb MB）`n")
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: YunX-Desktop-portable-${{ github.event.pull_request.number || github.run_number }}
+          path: YunX-Desktop-portable-*.zip
+          retention-days: 14
+          # 文件本身已是 zip，跳过二次压缩
+          compression-level: 0

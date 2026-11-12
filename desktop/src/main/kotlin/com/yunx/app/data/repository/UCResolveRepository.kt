@@ -1,0 +1,171 @@
+package com.yunx.app.data.repository
+
+import com.yunx.app.data.network.UCApi
+import com.yunx.app.data.network.UCConstants
+import com.yunx.app.data.network.ShareLinkParser
+import com.yunx.app.data.network.model.DownloadLink
+import com.yunx.app.data.network.model.ShareFile
+import com.yunx.app.data.network.model.ShareSession
+
+/**
+ * UC 分享解析仓库：token → 列表 → 转存临时目录 → 下载直链。
+ */
+class UCResolveRepository(private val api: UCApi) : ShareResolveRepository {
+
+    /** 常见视频扩展名（分享视频走 play 转码流绕过会员墙；play 需个人云盘 fid，先转存临时目录） */
+    private val videoExts = setOf("mp4", "mkv", "mov", "avi", "webm", "flv", "ts", "m3u8", "wmv", "rmvb")
+
+    private fun isVideo(name: String): Boolean =
+        videoExts.contains(name.substringAfterLast('.', "").lowercase())
+
+    override suspend fun createSession(link: String, pwd: String?, cookie: String): Result<ShareSession> {
+        val parsed = ShareLinkParser.parse(link)
+            ?: return Result.failure(IllegalArgumentException("无法识别分享链接"))
+        val effectivePwd = pwd?.takeIf { it.isNotBlank() } ?: parsed.pwd
+        return runCatching {
+            val token = api.getShareToken(parsed.shareId, effectivePwd, cookie)
+                ?: throw IllegalStateException("未获取到分享凭证")
+            ShareSession(parsed.shareId, token.stoken, token.title)
+        }.fold(
+            onSuccess = { Result.success(it) },
+            onFailure = { Result.failure(it) }
+        )
+    }
+
+    override suspend fun listFiles(session: ShareSession, dirFid: String, cookie: String): Result<List<ShareFile>> =
+        runCatching {
+            // 必须用 transfer_share/detail（带 stoken），返回的 share_fid_token 与 stoken 绑定
+            // 按 fid 去重翻页：不能只靠「本页是否满 50」判断结束（服务端可能截断单页大小）
+            val all = LinkedHashMap<String, ShareFile>()
+            var page = 1
+            while (page <= 200) {
+                val batch = api.getTransferShareFiles(session.shareId, session.stoken, dirFid, cookie, page, 50)
+                    ?: throw IllegalStateException("未获取到文件列表")
+                if (batch.isEmpty()) break
+                val before = all.size
+                for (file in batch) {
+                    val key = file.fid.ifBlank { "${file.pdirFid}/${file.fname}" }
+                    all.putIfAbsent(key, file)
+                }
+                if (all.size == before) break
+                page++
+            }
+            all.values.toList()
+        }.fold(
+            onSuccess = { Result.success(it) },
+            onFailure = { Result.failure(it) }
+        )
+
+    override suspend fun ensureTempDir(cookie: String): Result<String> = runCatching {
+        val rootFiles = api.getFileList(UCConstants.DEFAULT_PDIR_FID, cookie)
+            ?: throw IllegalStateException("获取网盘目录失败")
+        rootFiles.firstOrNull { it.isdir && it.fname == UCConstants.TEMP_DIR_NAME }?.fid
+            ?: api.createFolder(UCConstants.TEMP_DIR_NAME, UCConstants.DEFAULT_PDIR_FID, cookie)
+            ?: throw IllegalStateException("创建临时目录失败")
+    }.fold(
+        onSuccess = { Result.success(it) },
+        onFailure = { Result.failure(it) }
+    )
+
+    override suspend fun transferFile(
+        session: ShareSession,
+        file: ShareFile,
+        toDirFid: String,
+        cookie: String,
+        skipSpaceCheck: Boolean
+    ): Result<String> = runCatching {
+        // 转存前置空间校验：空间不足直接抛出，不再走后面的转存与轮询（避免被误报「转存超时」）；
+        // 批量入口已做过整批预算校验时跳过（避免同一批多次查配额）
+        if (!skipSpaceCheck) {
+            TransferSpaceGuard.ensureEnoughSpace(file.fsize.takeIf { it > 0 }, "UC") { api.getQuota(cookie) }
+        }
+        val taskId = api.saveShareFile(
+            shareId = session.shareId,
+            stoken = session.stoken,
+            pdirFid = file.pdirFid,
+            fid = file.fid,
+            fidToken = file.fidToken,
+            toPdirFid = toDirFid,
+            cookie = cookie
+        ) ?: throw IllegalStateException("转存失败")
+        api.pollTask(taskId, cookie)
+            ?: throw IllegalStateException("转存超时，请稍后重试")
+    }.fold(
+        onSuccess = { Result.success(it) },
+        onFailure = { Result.failure(it) }
+    )
+
+    override suspend fun getDownloadLink(fid: String, cookie: String): Result<DownloadLink> = runCatching {
+        api.getDownloadLink(fid, cookie)
+            ?: throw IllegalStateException("获取下载链接失败")
+    }.fold(
+        onSuccess = { Result.success(it) },
+        onFailure = { Result.failure(it) }
+    )
+
+    /** 批量转存前的整批空间预算校验：只查一次配额，不足时抛出（UC 转存同样占用目标账号空间） */
+    override suspend fun ensureBatchSpace(sizes: List<Long>, credential: String): Boolean =
+        TransferSpaceGuard.ensureEnoughSpaceForBatch(sizes, "UC") { api.getQuota(credential) }
+
+    /**
+     * UC 官方下载流程：无需转存！
+     * 直接用分享 fid + fid_token + stoken + pwd_id 调 download 接口取直链。
+     * skipSpaceCheck 仅用于对齐接口（UC 下载不转存、不占空间，故此处不做空间校验）。
+     */
+    override suspend fun getShareDownloadLink(
+        session: ShareSession,
+        file: ShareFile,
+        cookie: String,
+        skipSpaceCheck: Boolean
+    ): Result<DownloadLink> = runCatching {
+        // 视频：优先用分享态 video_preview 取**原画**直链（走播放回调 checkplay，不换片，绕过宣传片替换）
+        if (isVideo(file.fname)) {
+            val preview = api.getVideoPreview(
+                pwdId = session.shareId,
+                stoken = session.stoken,
+                fid = file.fid,
+                fidToken = file.fidToken,
+                cookie = cookie
+            )
+            if (preview != null) {
+                return@runCatching DownloadLink(
+                    fid = file.fid,
+                    filename = file.fname,
+                    downloadUrl = preview.downloadUrl,
+                    size = preview.size,
+                    isHls = false
+                )
+            }
+        }
+        api.getShareDownloadLink(
+            fid = file.fid,
+            fidToken = file.fidToken,
+            stoken = session.stoken,
+            pwdId = session.shareId,
+            cookie = cookie
+        ) ?: throw IllegalStateException("获取下载链接失败")
+    }.fold(
+        onSuccess = { Result.success(it) },
+        onFailure = { Result.failure(it) }
+    )
+
+    /**
+     * 游客取链（未登录）：与登录态同一条 download 接口，只是不带账号 Cookie，
+     * 由服务端下发游客态 __pugs（UC 实测大文件也放行，不做大小限制）。
+     * 视频不走 video_preview —— 那条链路依赖登录态，这里直接取普通直链。
+     */
+    override suspend fun getGuestShareDownloadLink(
+        session: ShareSession,
+        file: ShareFile
+    ): Result<DownloadLink> = runCatching {
+        api.getGuestShareDownloadLink(
+            fid = file.fid,
+            fidToken = file.fidToken,
+            stoken = session.stoken,
+            pwdId = session.shareId
+        ) ?: throw IllegalStateException("获取下载链接失败")
+    }.fold(
+        onSuccess = { Result.success(it) },
+        onFailure = { Result.failure(it) }
+    )
+}

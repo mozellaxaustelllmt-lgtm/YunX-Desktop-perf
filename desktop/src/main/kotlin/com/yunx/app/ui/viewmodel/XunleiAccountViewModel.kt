@@ -1,0 +1,248 @@
+package com.yunx.app.ui.viewmodel
+
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.CreationExtras
+import kotlin.reflect.KClass
+import com.yunx.app.data.db.XunleiAccountEntity
+import com.yunx.app.data.network.XunleiApi
+import com.yunx.app.data.network.XunleiLoginStep
+import com.yunx.app.data.repository.XunleiAccountRepository
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+
+/** 短信重发冷却时长：与官方 App 一致，避免连点把短信打爆 */
+private const val SMS_RESEND_COOLDOWN_MS = 60_000L
+
+/**
+ * 迅雷账号 ViewModel：账号密码 / 短信 / 网页三条登录入口 → 换 token 落库。
+ */
+class XunleiAccountViewModel(
+    private val repository: XunleiAccountRepository
+) : ViewModel() {
+
+    val xunleiAccount: StateFlow<XunleiAccountEntity?> = repository.observeAccount()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = null
+        )
+
+    /** 密码登录结果（needSms=true 时 UI 切到短信验证步骤） */
+    var loginStep by androidx.compose.runtime.mutableStateOf<XunleiLoginStep?>(null)
+        private set
+
+    /** 登录错误信息 */
+    var loginError by androidx.compose.runtime.mutableStateOf<String?>(null)
+        private set
+
+    /** 短信验证码是否已发送（区分「发送验证码」/「重新发送验证码」） */
+    var smsSent by androidx.compose.runtime.mutableStateOf(false)
+        private set
+
+    /** 短信发送在途（按钮转圈 + 防止连点造成多条短信） */
+    var sendingSms by androidx.compose.runtime.mutableStateOf(false)
+        private set
+
+    /**
+     * 验证码重发冷却截止时刻（毫秒时间戳；0 = 可立即发送）。
+     * 放在 ViewModel 而不是登录页的局部状态里，有两个原因：
+     * 1. 只有**真的发出去了**才开始计时（发送失败或请求被丢弃时不该让用户白等一分钟）；
+     * 2. 用的是墙上时钟，切 Tab / 重进页面都不会把倒计时弄丢或算错。
+     */
+    var smsCooldownUntil by androidx.compose.runtime.mutableStateOf(0L)
+        private set
+
+    /** 最近一次密码登录凭据（WebView 验证成功后自动重试登录用，仅内存，不持久化） */
+    private var lastUsername = ""
+    private var lastPassword = ""
+
+    fun consumeLoginError() {
+        loginError = null
+    }
+
+    /**
+     * 「添加账号」标记：网盘页账号弹窗点「添加账号」时置位，登录页关闭时清掉。
+     * 置位后这一次登录会落成新的账号行，而不是覆盖当前主账号（见 resolveAccountSlot）。
+     */
+    private var addNewAccount = false
+
+    fun beginAddAccount() { addNewAccount = true }
+
+    /** 当前是否是「添加账号」（网页登录页据此清掉旧登录态，避免静默登回旧账号） */
+    val isAddingAccount: Boolean get() = addNewAccount
+
+    /**
+     * 登录成功计数（每次落库成功 +1）：登录页据此自动关闭。
+     *
+     * ★ 不能用「账号非空」判断 —— 「添加账号」时旧账号本来就在，登录页一渲染就会被
+     *   误判成登录成功而立刻关闭（用户看到的就是「打开闪一下就关闭」）。
+     */
+    var loginSucceeded by androidx.compose.runtime.mutableStateOf(0)
+        private set
+
+    fun cancelAddAccount() { addNewAccount = false }
+
+    /** 账号密码登录 */
+    fun login(username: String, password: String) {
+        lastUsername = username.trim()
+        lastPassword = password
+        viewModelScope.launch {
+            loginError = null
+            loginStep = null
+            smsSent = false
+            // 登录接口不吞异常（网络断了会抛 IOException）：这里兜住，把它变成一句提示，
+            // 而不是让协程把界面打崩
+            val step = try {
+                repository.loginWithPassword(username.trim(), password)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                loginError = "登录失败，请检查网络后重试"
+                return@launch
+            }
+            try {
+                if (step.needSms) {
+                    // 触发安全验证：优先用 reviewurl 里的 creditkey（风控响应自带），否则走自有 sendSms
+                    val reviewMap = XunleiApi.parseReviewUrl(step.reviewUrl)
+                    val creditKey = reviewMap["creditkey"].orEmpty()
+                    if (creditKey.isNotBlank()) {
+                        // 直接用响应里的 creditkey/token 进入短信输入步骤（token 可能为空，sendSms 会补）；
+                        // 进入界面不会自动发送验证码，smsSent 保持 false，UI 显示「发送验证码」
+                        loginStep = step.copy(
+                            smsCreditKey = creditKey,
+                            smsToken = reviewMap["token"].orEmpty()
+                        )
+                    } else {
+                        val smsStep = repository.sendSms(username.trim())
+                        if (smsStep.smsCreditKey.isNotBlank()) {
+                            smsSent = true
+                            smsCooldownUntil = System.currentTimeMillis() + SMS_RESEND_COOLDOWN_MS
+                            loginStep = smsStep
+                        } else {
+                            // 不再丢外部链接：给明确失败提示 + 让用户重试
+                            loginError = smsStep.message.ifBlank { "短信发送失败，请重试或检查网络" }
+                            loginStep = step.copy(message = "短信发送失败")
+                        }
+                    }
+                } else if (step.sessionKey.isNotBlank() && step.sessionId.isNotBlank()) {
+                    val ok = repository.finishLogin(step, username.trim(), newAccount = addNewAccount)
+                    if (ok) {
+                        addNewAccount = false
+                        loginSucceeded++
+                    } else {
+                        loginError = "登录失败，无法换取凭证"
+                    }
+                } else {
+                    loginError = step.message.ifBlank { "登录失败，请检查账号密码" }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                loginError = "登录失败，请检查网络后重试"
+                loginStep = step.copy(message = "网络异常")
+            }
+        }
+    }
+
+    /** WebView 验证成功后自动重试登录（设备已验证受信任，密码登录应直接成功） */
+    fun retryLoginAfterVerify() {
+        if (lastUsername.isNotBlank() && lastPassword.isNotBlank()) {
+            login(lastUsername, lastPassword)
+        }
+    }
+
+    /** 发送短信验证码（密码登录触发验证后 / 短信登录第一步，两条流程共用） */
+    fun sendSms(mobile: String) {
+        if (sendingSms) return
+        viewModelScope.launch {
+            loginError = null
+            sendingSms = true
+            try {
+                val step = repository.sendSms(mobile.trim())
+                if (step.smsCreditKey.isNotBlank()) {
+                    smsSent = true
+                    // 冷却从「服务端确认发出」开始算，失败则允许立刻重试
+                    smsCooldownUntil = System.currentTimeMillis() + SMS_RESEND_COOLDOWN_MS
+                }
+                loginStep = step
+                if (step.smsCreditKey.isBlank()) loginError = step.message
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                loginError = "短信发送失败，请检查网络后重试"
+            } finally {
+                // 必须放 finally：中途抛异常时按钮上的转圈要能停，否则按钮永远点不动
+                sendingSms = false
+            }
+        }
+    }
+
+    /** 短信验证码登录并完成 */
+    fun loginWithSms(mobile: String, code: String, creditKey: String, smsToken: String) {
+        viewModelScope.launch {
+            loginError = null
+            val ok = try {
+                repository.loginWithSms(
+                    mobile.trim(),
+                    code.trim(),
+                    creditKey,
+                    smsToken,
+                    newAccount = addNewAccount
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                loginError = "登录失败，请检查网络后重试"
+                return@launch
+            }
+            if (ok) {
+                addNewAccount = false
+                loginSucceeded++
+            } else {
+                loginError = "验证码校验失败"
+            }
+        }
+    }
+
+    /**
+     * 网页登录（pan.xunlei.com）自动检测/手动保存共用入口：解析 + 校验 + 落库。
+     * 返回 false 表示「还没有真正登录」，登录页据此继续轮询而不是报错。
+     */
+    suspend fun saveWebCredential(raw: String): Boolean {
+        val saved = repository.saveWebCredential(raw, newAccount = addNewAccount)
+        if (saved) {
+            addNewAccount = false
+            loginSucceeded++
+        }
+        return saved
+    }
+
+    /** 切换登录方式 / 进入登录页时清掉上一步的中间态（旧 creditkey/token 不能带到新流程里提交） */
+    fun resetLoginStep() {
+        loginStep = null
+        smsSent = false
+        loginError = null
+    }
+
+    fun logout() {
+        viewModelScope.launch { repository.logout() }
+    }
+
+    class Factory(
+        private val repository: XunleiAccountRepository
+    ) : ViewModelProvider.Factory {
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : ViewModel> create(modelClass: KClass<T>, extras: CreationExtras): T {
+            require(modelClass == XunleiAccountViewModel::class)
+            return XunleiAccountViewModel(repository) as T
+        }
+    }
+}

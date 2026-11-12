@@ -1,0 +1,105 @@
+package com.yunx.app.ui.screens
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import com.yunx.app.data.db.MultiAccountEntity
+import com.yunx.app.data.db.XunleiAccountEntity
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * 已登录迅雷账号的底部弹窗：昵称、设备号、登录时间 + 退出登录（二次确认）。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun XunleiAccountSheet(
+    account: XunleiAccountEntity,
+    accounts: List<MultiAccountEntity>,
+    onSetPrimary: (String) -> Unit,
+    onRename: (String, String) -> Unit,
+    onRemove: (String) -> Unit,
+    onAddAccount: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val loginTime = remember(account.updatedAt) {
+        SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(account.updatedAt))
+    }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState, containerColor = MaterialTheme.colorScheme.surface) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 24.dp, end = 24.dp, top = 4.dp, bottom = 32.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(modifier = Modifier.size(52.dp), shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(
+                            account.nickname.take(1),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.width(16.dp))
+                Column {
+                    Text(account.nickname, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(modifier = Modifier.size(8.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("迅雷网盘 · 已登录", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(24.dp))
+            Text("登录信息", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(modifier = Modifier.height(8.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.large,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    InfoRow(label = "登录时间", value = loginTime)
+                    Spacer(modifier = Modifier.height(12.dp))
+                    InfoRow(label = "设备号", value = account.deviceId.ifBlank { "-" })
+                }
+            }
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // 多账号：同一网盘可以同时登录多个账号，这里管理它们（主账号 / 备注 / 退出 / 添加）
+            AccountListSection(
+                accounts = accounts,
+                onSetPrimary = onSetPrimary,
+                onRename = onRename,
+                onRemove = onRemove,
+                onAddAccount = onAddAccount,
+                onEmpty = onDismiss
+            )
+        }
+    }
+}
+
+@Composable
+private fun InfoRow(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(72.dp)
+        )
+        Text(value, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+    }
+}

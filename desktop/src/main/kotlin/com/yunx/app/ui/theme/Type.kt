@@ -1,0 +1,161 @@
+@file:OptIn(androidx.compose.ui.text.ExperimentalTextApi::class)
+
+package com.yunx.app.ui.theme
+
+import androidx.compose.material3.Typography
+import androidx.compose.ui.text.FontHinting
+import androidx.compose.ui.text.FontRasterizationSettings
+import androidx.compose.ui.text.FontSmoothing
+import androidx.compose.ui.text.ParagraphStyle
+import androidx.compose.ui.text.PlatformParagraphStyle
+import androidx.compose.ui.text.TextLinkStyles
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
+
+/**
+ * Windows 文字渲染按后端自适应：
+ * - SOFTWARE：亚像素 ClearType + Slight hinting（CPU 光栅化下观感最锐利）；
+ * - GPU（默认 OPENGL，备选 DIRECT3D）：灰度抗锯齿下采用 GDI 风格渲染追求最大锐度：
+ *   Full hinting + 强制自动暗示把笔画对齐像素网格，并关闭亚像素定位
+ *   （分数坐标会让同一字形的灰度分布不一致，反而显糊）。
+ *   OPENGL 下此配置经用户实测：文字清晰 + 动画流畅（DIRECT3D 下 hinting 无改善）。
+ * 仅桌面端生效（PlatformParagraphStyle 为 desktop API）。
+ */
+private val isSoftwareBackend =
+    (System.getProperty("skiko.renderApi") ?: "SOFTWARE") == "SOFTWARE"
+
+private val CrispPlatformStyle = PlatformParagraphStyle(
+    fontRasterizationSettings = if (isSoftwareBackend) {
+        FontRasterizationSettings(
+            smoothing = FontSmoothing.SubpixelAntiAlias,
+            hinting = FontHinting.Slight,
+            subpixelPositioning = true,
+            autoHintingForced = false
+        )
+    } else {
+        FontRasterizationSettings(
+            smoothing = FontSmoothing.AntiAlias,
+            hinting = FontHinting.Full,
+            subpixelPositioning = false,
+            autoHintingForced = true
+        )
+    }
+)
+
+private fun TextStyle.crisp(): TextStyle = merge(ParagraphStyle(platformStyle = CrispPlatformStyle))
+
+private fun crispAll(t: Typography): Typography = Typography(
+    displayLarge = t.displayLarge.crisp(),
+    displayMedium = t.displayMedium.crisp(),
+    displaySmall = t.displaySmall.crisp(),
+    headlineLarge = t.headlineLarge.crisp(),
+    headlineMedium = t.headlineMedium.crisp(),
+    headlineSmall = t.headlineSmall.crisp(),
+    titleLarge = t.titleLarge.crisp(),
+    titleMedium = t.titleMedium.crisp(),
+    titleSmall = t.titleSmall.crisp(),
+    bodyLarge = t.bodyLarge.crisp(),
+    bodyMedium = t.bodyMedium.crisp(),
+    bodySmall = t.bodySmall.crisp(),
+    labelLarge = t.labelLarge.crisp(),
+    labelMedium = t.labelMedium.crisp(),
+    labelSmall = t.labelSmall.crisp()
+)
+
+/**
+ * 全局排版：沿用 Material 3 刻度，保持标题与正文的清晰层级。
+ */
+val Typography = crispAll(Typography(
+    // 顶部大标题（折叠后使用 titleLarge）
+    headlineMedium = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 28.sp,
+        lineHeight = 36.sp,
+        letterSpacing = 0.sp
+    ),
+    titleLarge = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 22.sp,
+        lineHeight = 28.sp,
+        letterSpacing = 0.sp
+    ),
+    titleMedium = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Medium,
+        fontSize = 16.sp,
+        lineHeight = 24.sp,
+        letterSpacing = 0.15.sp
+    ),
+    bodyLarge = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Normal,
+        fontSize = 16.sp,
+        lineHeight = 24.sp,
+        letterSpacing = 0.5.sp
+    ),
+    bodyMedium = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Normal,
+        fontSize = 14.sp,
+        lineHeight = 20.sp,
+        letterSpacing = 0.25.sp
+    ),
+    labelLarge = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Medium,
+        fontSize = 14.sp,
+        lineHeight = 20.sp,
+        letterSpacing = 0.1.sp
+    ),
+    labelMedium = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Medium,
+        fontSize = 12.sp,
+        lineHeight = 16.sp,
+        letterSpacing = 0.5.sp
+    ),
+    labelSmall = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Medium,
+        fontSize = 11.sp,
+        lineHeight = 13.sp,
+        letterSpacing = 0.05.sp
+    )
+    )
+)
+
+/**
+ * 紧凑 Markdown 排版：对齐 GitHub 桌面端观感（正文 14sp、标题逐级收紧、行距 1.35 倍）。
+ * 供 GitHub 仓库 README 的 m3 Markdown 渲染复用（见 ui/components/GitHubMarkdownImageTransformer.kt）。
+ * 调用方用 `remember { compactMarkdownTypography() }` 包一层即可。
+ */
+fun compactMarkdownTypography() = run {
+    fun body(size: Int, bold: Boolean = false) = TextStyle(
+        fontSize = size.sp,
+        lineHeight = (size * 1.35f).toInt().sp,
+        fontWeight = if (bold) FontWeight.Bold else FontWeight.Normal
+    )
+    com.mikepenz.markdown.model.DefaultMarkdownTypography(
+        text = body(14),
+        code = body(13),
+        inlineCode = body(13),
+        h1 = body(20, true),
+        h2 = body(18, true),
+        h3 = body(16, true),
+        h4 = body(15, true),
+        h5 = body(14, true),
+        h6 = body(14, true),
+        quote = body(13),
+        paragraph = body(14),
+        ordered = body(14),
+        bullet = body(14),
+        list = body(14),
+        link = body(14),
+        textLink = TextLinkStyles(),
+        table = body(13)
+    )
+}

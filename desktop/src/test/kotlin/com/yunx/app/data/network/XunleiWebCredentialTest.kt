@@ -1,0 +1,147 @@
+package com.yunx.app.data.network
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * 迅雷网页登录凭据的判定逻辑。
+ *
+ * 只测纯函数（[XunleiWebCredential.fieldsFrom] / [XunleiWebCredential.parseRawToken] /
+ * [XunleiWebCredential.isValidToken] / [XunleiWebCredential.computeCaptchaSign]）：JSON 那一层
+ * （`parse` 的整段文本解析）依赖 org.json 的具体实现，由真实登录流程验证。
+ */
+class XunleiWebCredentialTest {
+
+    /** 一个长度/字符集都合法的假 token（32 位十六进制，与真实 JWT 一样能过校验） */
+    private val access = "0123456789abcdef0123456789abcdef"
+    private val refresh = "fedcba9876543210fedcba9876543210"
+
+    @Test
+    fun readsSnakeCaseFields() {
+        val tokens = XunleiWebCredential.fieldsFrom(
+            mapOf(
+                "access_token" to access,
+                "refresh_token" to refresh,
+                "device_id" to "78a70629a2b17d0b4302317ffa94807a",
+                "captcha_token" to "captcha-token-1234567890",
+                "sub" to "user-1",
+                "nick_name" to "迅雷用户"
+            )
+        )
+        assertEquals(access, tokens?.accessToken)
+        assertEquals(refresh, tokens?.refreshToken)
+        assertEquals("78a70629a2b17d0b4302317ffa94807a", tokens?.deviceId)
+        assertEquals("captcha-token-1234567890", tokens?.captchaToken)
+        assertEquals("user-1", tokens?.userId)
+        assertEquals("迅雷用户", tokens?.nickname)
+    }
+
+    @Test
+    fun readsCamelCaseFields() {
+        val tokens = XunleiWebCredential.fieldsFrom(
+            mapOf("accessToken" to access, "refreshToken" to refresh, "deviceId" to "abc", "userId" to "u2")
+        )
+        assertEquals(access, tokens?.accessToken)
+        assertEquals(refresh, tokens?.refreshToken)
+        assertEquals("abc", tokens?.deviceId)
+        assertEquals("u2", tokens?.userId)
+    }
+
+    /** 网页登录过程中会把中间态写进 localStorage：半截/占位 token 一律不能当成登录成功 */
+    @Test
+    fun rejectsPlaceholderAndShortTokens() {
+        assertNull(XunleiWebCredential.fieldsFrom(mapOf("access_token" to "null")))
+        assertNull(XunleiWebCredential.fieldsFrom(mapOf("access_token" to "undefined")))
+        assertNull(XunleiWebCredential.fieldsFrom(mapOf("access_token" to "short")))
+        assertNull(XunleiWebCredential.fieldsFrom(mapOf("access_token" to "")))
+        assertNull(XunleiWebCredential.fieldsFrom(emptyMap()))
+    }
+
+    @Test
+    fun rejectsTokensWithIllegalCharacters() {
+        // 带空格 / 换行的值不是 token：可能是页面写入的说明文案
+        assertNull(XunleiWebCredential.fieldsFrom(mapOf("access_token" to "has space in it 1234567890")))
+        assertNull(XunleiWebCredential.fieldsFrom(mapOf("access_token" to "$access\nsecond")))
+    }
+
+    /** access 缺失但 refresh 可用时仍然算登录成功（少见，但刷新后能救回来） */
+    @Test
+    fun acceptsRefreshOnlyCredential() {
+        val tokens = XunleiWebCredential.fieldsFrom(mapOf("refresh_token" to refresh))
+        assertEquals("", tokens?.accessToken)
+        assertEquals(refresh, tokens?.refreshToken)
+    }
+
+    /** 非法 captcha 只丢弃该字段，不影响整体登录（captcha 只影响云接口的风控） */
+    @Test
+    fun dropsInvalidCaptchaButKeepsCredential() {
+        val tokens = XunleiWebCredential.fieldsFrom(
+            mapOf("access_token" to access, "captcha_token" to "bad")
+        )
+        assertEquals(access, tokens?.accessToken)
+        assertEquals("", tokens?.captchaToken)
+    }
+
+    @Test
+    fun parsesRawTokenWithAndWithoutBearerPrefix() {
+        assertEquals(access, XunleiWebCredential.parseRawToken(access)?.accessToken)
+        assertEquals(access, XunleiWebCredential.parseRawToken("  Bearer $access  ")?.accessToken)
+        assertEquals(access, XunleiWebCredential.parseRawToken("bearer $access")?.accessToken)
+        assertNull(XunleiWebCredential.parseRawToken("not-a-token"))
+    }
+
+    @Test
+    fun validatesTokenShape() {
+        assertTrue(XunleiWebCredential.isValidToken(access))
+        assertTrue(XunleiWebCredential.isValidToken("a".repeat(16384)))
+        assertFalse(XunleiWebCredential.isValidToken("a".repeat(16385)))
+        assertFalse(XunleiWebCredential.isValidToken("a".repeat(15)))
+        assertFalse(XunleiWebCredential.isValidToken("null"))
+        assertFalse(XunleiWebCredential.isValidToken("has space 1234567890"))
+    }
+
+    /**
+     * 端到端：整段 JSON / 带引号的 JSON 字符串 / 裸 token 三种粘贴形态。
+     */
+    @Test
+    fun parseHandlesJsonAndBareTokenInputs() {
+        assertNull(XunleiWebCredential.parse(""))
+        assertNull(XunleiWebCredential.parse("   "))
+        assertEquals(access, XunleiWebCredential.parse(access)?.accessToken)
+        assertEquals(access, XunleiWebCredential.parse("Bearer $access")?.accessToken)
+        assertEquals(access, XunleiWebCredential.parse("{\"access_token\":\"$access\"}")?.accessToken)
+    }
+
+    /**
+     * 桌面 client hints 常量必须是**带引号的**品牌字符串（client hints 规范要求），且运行时
+     * 字符串里是普通双引号、**不含反斜杠**——源码里的 `\"` 只是 Kotlin 转义写法。
+     */
+    @Test
+    fun desktopClientHintConstantsMatchChrome() {
+        assertEquals(
+            "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+            XunleiWebCredential.DESKTOP_SEC_CH_UA
+        )
+        assertEquals("?0", XunleiWebCredential.DESKTOP_SEC_CH_UA_MOBILE)
+        assertEquals("\"Windows\"", XunleiWebCredential.DESKTOP_SEC_CH_UA_PLATFORM)
+        assertFalse(XunleiWebCredential.DESKTOP_SEC_CH_UA.contains('\\'))
+        assertFalse(XunleiWebCredential.DESKTOP_SEC_CH_UA_PLATFORM.contains('\\'))
+    }
+
+    /**
+     * 网页版 captcha_sign 的已知向量（抓包验证过的那一组）。
+     *
+     * 锁死 9 条盐的**内容与顺序**、client_version、host 拼接方式与 `1.` 前缀：
+     * 任何一处被误改都会立刻失败，避免「盐轮换时手改成错的」这种线上事故。
+     */
+    @Test
+    fun computesWebCaptchaSignForKnownVector() {
+        assertEquals(
+            "1.4181a24198c7edfbbba2afbcf1f4fab0",
+            XunleiWebCredential.computeCaptchaSign("550cfe136e9d74e95be5393738639de7", 1792243618981L)
+        )
+    }
+}

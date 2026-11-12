@@ -1,0 +1,1089 @@
+diff --git a/desktop/src/main/kotlin/com/yunx/app/data/db/AppDatabase.kt b/desktop/src/main/kotlin/com/yunx/app/data/db/AppDatabase.kt
+index d02e283..2ac16ad 100644
+--- a/desktop/src/main/kotlin/com/yunx/app/data/db/AppDatabase.kt
++++ b/desktop/src/main/kotlin/com/yunx/app/data/db/AppDatabase.kt
+@@ -16,6 +16,10 @@ import java.sql.DriverManager
+ import java.sql.PreparedStatement
+ import java.sql.ResultSet
+ import java.sql.Statement
++import java.util.concurrent.LinkedBlockingQueue
++import java.util.concurrent.ThreadPoolExecutor
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
+ 
+ /**
+  * 桌面版数据库：以 sqlite-jdbc（JDBC）替代 Room，公共 API（DAO 签名、加密装饰器）保持不变。
+@@ -928,12 +932,44 @@ private class JdbcVideoAccountDao(private val conn: Connection) : VideoAccountDa
+     }
+ }
+ 
++/**
++ * 下载任务 DAO（JDBC 直连 SQLite）。
++ *
++ * ★ 性能约定（几千～上万条任务时必须遵守，改动前先读）★
++ * 1. **绝不重读全表**：旧实现的每个写方法末尾都 `reload()` = `SELECT *` 全表 + 重建全部实体 +
++ *    发射新列表。批量入队 N 个文件时这就是 O(N²)（3000 条 ≈ 450 万行解析），
++ *    而进度落盘每秒还会再来几次全表扫描。现在所有写方法只在内存里改**那一行**（O(1)）。
++ * 2. **发射节流**：内存快照每 `publishIntervalMs`（100ms）最多发射一次（尾沿合并）。
++ *    批量入队 1 万个文件 → 最多 10 次/秒的列表发射，而不是 1 万次。
++ * 3. `loadAll()` 只在进程启动（[init]）与 `listAll()` 快照里使用。
++ */
+ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDao {
+ 
++    /** 全表快照的发射节流间隔（毫秒）：合并同一窗口内的多次变更，避免发射风暴 */
++    private val publishIntervalMs = 100L
++
++    /**
++     * 内存索引：id → 实体。迭代顺序 = 插入顺序 = createTime 升序；
++     * 发射时反转成「最新的在最上面」（与 SQL `ORDER BY createTime DESC` 等价）。
++     * 所有读写都在 [byId] 的锁内完成。
++     */
++    private val byId = LinkedHashMap<Long, DownloadTaskEntity>()
++
+     private val _tasks = MutableStateFlow<List<DownloadTaskEntity>>(emptyList())
+ 
++    /** 节流发射器（单线程守护，空闲 30s 回收；只做「生成快照 + 赋值」这点活） */
++    private val publisher = ThreadPoolExecutor(
++        1, 1, 30L, TimeUnit.SECONDS, LinkedBlockingQueue<Runnable>()
++    ) { r -> Thread(r, "yunx-task-publisher").apply { isDaemon = true } }
++        .apply { allowCoreThreadTimeOut(true) }
++
++    /** 是否已有一个待执行的发射（合并窗口内只留一个） */
++    private val publishScheduled = AtomicBoolean(false)
++
+     init {
+-        _tasks.value = loadAll()
++        val all = loadAll()
++        synchronized(byId) { all.asReversed().forEach { byId[it.id] = it } }
++        _tasks.value = all
+     }
+ 
+     private fun loadAll(): List<DownloadTaskEntity> = synchronized(conn) {
+@@ -946,8 +982,49 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+         }
+     }
+ 
+-    private fun reload() {
+-        _tasks.value = loadAll()
++    /** 当前快照（createTime 倒序的新列表；已发布出去的列表绝不原地修改） */
++    private fun snapshot(): List<DownloadTaskEntity> = synchronized(byId) {
++        byId.values.toList().asReversed()
++    }
++
++    private fun publishNow() {
++        val snap = snapshot()
++        _tasks.value = snap
++    }
++
++    /** 合并发射：同一窗口内的多次结构变更只发一次（尾沿，最迟 [publishIntervalMs] 后可见） */
++    private fun schedulePublish() {
++        if (!publishScheduled.compareAndSet(false, true)) return
++        runCatching {
++            publisher.execute {
++                try {
++                    Thread.sleep(publishIntervalMs)
++                } catch (_: InterruptedException) {
++                    // 进程退出时忽略
++                }
++                publishScheduled.set(false)
++                runCatching { publishNow() }
++            }
++        }.onFailure {
++            // 线程池被关掉（进程退出中）：退化成同步发射，保证不丢更新
++            publishScheduled.set(false)
++            runCatching { publishNow() }
++        }
++    }
++
++    /** 只改内存里的那一行（O(1)）并触发合并发射 */
++    private fun patchRow(id: Long, transform: (DownloadTaskEntity) -> DownloadTaskEntity) {
++        synchronized(byId) {
++            val cur = byId[id] ?: return
++            val next = transform(cur)
++            if (next != cur) byId[id] = next
++        }
++        schedulePublish()
++    }
++
++    private companion object {
++        /** 批量 SQL 的 IN 列表分片大小（分批只为单条语句不过长，不是 SQLite 的硬限制） */
++        const val SQL_IN_BATCH = 400
+     }
+ 
+     private fun readTask(rs: ResultSet) = DownloadTaskEntity(
+@@ -1023,7 +1100,11 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 ps.executeUpdate()
+                 ps.generatedKeys.use { gk -> if (gk.next()) gk.getLong(1) else task.id }
+             }
+-        }.also { reload() }
++        }.also { id ->
++            // ★ 只登记新增的这一行（O(1)）：批量入队 1 万个文件时，这里省掉 1 万次全表 SELECT
++            synchronized(byId) { byId[id] = task.copy(id = id) }
++            schedulePublish()
++        }
+     }
+ 
+     override suspend fun get(id: Long): DownloadTaskEntity? = dbIo {
+@@ -1044,7 +1125,19 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                     "WHERE status = 3 AND totalSize > 0 AND downloadedSize < totalSize"
+             ).use { it.executeUpdate() }
+         }
+-        reload()
++        // 内存同步：条件与上面 SQL 逐字对应，只改受影响的行
++        synchronized(byId) {
++            byId.replaceAll { _, t ->
++                if (t.status == DownloadTaskEntity.STATUS_COMPLETED &&
++                    t.totalSize > 0 && t.downloadedSize < t.totalSize
++                ) {
++                    t.copy(downloadedSize = t.totalSize)
++                } else {
++                    t
++                }
++            }
++        }
++        schedulePublish()
+     }
+ 
+     override suspend fun updateProgress(id: Long, status: Int, downloadedSize: Long, totalSize: Long) = dbIo {
+@@ -1059,7 +1152,9 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 ps.executeUpdate()
+             }
+         }
+-        reload()
++        // ★ 进度落盘是热路径（并发任务每 500ms 一次）：只替换内存里的这一行，
++        //   不重读全表。发射走 100ms 合并窗口，界面进度条照样跟得上。
++        patchRow(id) { it.copy(status = status, downloadedSize = downloadedSize, totalSize = totalSize) }
+     }
+ 
+     override suspend fun updatePlan(id: Long, chunkCount: Int, totalSize: Long) = dbIo {
+@@ -1073,7 +1168,7 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 ps.executeUpdate()
+             }
+         }
+-        reload()
++        patchRow(id) { it.copy(chunkCount = chunkCount, plannedTotalSize = totalSize) }
+     }
+ 
+     override suspend fun updateRequestHeaders(id: Long, encryptedHeaders: String) = dbIo {
+@@ -1084,7 +1179,7 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 ps.executeUpdate()
+             }
+         }
+-        reload()
++        patchRow(id) { it.copy(requestHeadersJson = encryptedHeaders) }
+     }
+ 
+     override suspend fun markInterruptedAsPaused() = dbIo {
+@@ -1093,7 +1188,19 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 it.executeUpdate()
+             }
+         }
+-        reload()
++        // 内存同步：条件与 SQL 一致（下载中 / 等待中 → 暂停）
++        synchronized(byId) {
++            byId.replaceAll { _, t ->
++                if (t.status == DownloadTaskEntity.STATUS_PENDING ||
++                    t.status == DownloadTaskEntity.STATUS_DOWNLOADING
++                ) {
++                    t.copy(status = DownloadTaskEntity.STATUS_PAUSED)
++                } else {
++                    t
++                }
++            }
++        }
++        schedulePublish()
+     }
+ 
+     override suspend fun updateStatus(id: Long, status: Int) = dbIo {
+@@ -1104,7 +1211,7 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 ps.executeUpdate()
+             }
+         }
+-        reload()
++        patchRow(id) { it.copy(status = status) }
+     }
+ 
+     override suspend fun updateError(id: Long, errorMsg: String) = dbIo {
+@@ -1115,7 +1222,7 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 ps.executeUpdate()
+             }
+         }
+-        reload()
++        patchRow(id) { it.copy(errorMsg = errorMsg) }
+     }
+ 
+     override suspend fun complete(id: Long, status: Int, savePath: String, avgSpeed: Long) = dbIo {
+@@ -1134,7 +1241,15 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 ps.executeUpdate()
+             }
+         }
+-        reload()
++        // 内存同步：与上面 CASE WHEN 同语义
++        patchRow(id) {
++            it.copy(
++                status = status,
++                savePath = savePath,
++                avgSpeed = avgSpeed,
++                downloadedSize = if (it.totalSize > 0) it.totalSize else it.downloadedSize
++            )
++        }
+     }
+ 
+     override suspend fun delete(id: Long) = dbIo {
+@@ -1144,7 +1259,47 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 ps.executeUpdate()
+             }
+         }
+-        reload()
++        synchronized(byId) { byId.remove(id) }
++        schedulePublish()
++    }
++
++    override suspend fun deleteMany(ids: Collection<Long>) = dbIo {
++        if (ids.isEmpty()) return@dbIo
++        val chunked = ids.chunked(SQL_IN_BATCH)
++        synchronized(conn) {
++            chunked.forEach { batch ->
++                conn.prepareStatement(
++                    "DELETE FROM download_task WHERE id IN (${batch.joinToString(",") { "?" }})"
++                ).use { ps ->
++                    batch.forEachIndexed { i, id -> ps.setLong(i + 1, id) }
++                    ps.executeUpdate()
++                }
++            }
++        }
++        synchronized(byId) { ids.forEach { byId.remove(it) } }
++        schedulePublish()
++    }
++
++    override suspend fun updateStatusMany(ids: Collection<Long>, status: Int) = dbIo {
++        if (ids.isEmpty()) return@dbIo
++        ids.chunked(SQL_IN_BATCH).forEach { batch ->
++            synchronized(conn) {
++                conn.prepareStatement(
++                    "UPDATE download_task SET status = ? WHERE id IN (${batch.joinToString(",") { "?" }})"
++                ).use { ps ->
++                    ps.setInt(1, status)
++                    batch.forEachIndexed { i, id -> ps.setLong(i + 2, id) }
++                    ps.executeUpdate()
++                }
++            }
++        }
++        // 内存同步：一次批量改完，只触发一次发射
++        synchronized(byId) {
++            ids.forEach { id ->
++                byId[id]?.let { if (it.status != status) byId[id] = it.copy(status = status) }
++            }
++        }
++        schedulePublish()
+     }
+ 
+     override suspend fun updateEngineTaskId(id: Long, engineTaskId: String) = dbIo {
+@@ -1155,7 +1310,7 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 ps.executeUpdate()
+             }
+         }
+-        reload()
++        patchRow(id) { it.copy(engineTaskId = engineTaskId) }
+     }
+ 
+     override suspend fun updateDirect(id: Long, partPath: String, mode: Int) = dbIo {
+@@ -1167,7 +1322,7 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 ps.executeUpdate()
+             }
+         }
+-        reload()
++        patchRow(id) { it.copy(directPart = partPath, directMode = mode) }
+     }
+ 
+     override suspend fun updateFileName(id: Long, name: String) = dbIo {
+@@ -1178,7 +1333,7 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
+                 ps.executeUpdate()
+             }
+         }
+-        reload()
++        patchRow(id) { it.copy(fileName = name) }
+     }
+ 
+     override suspend fun listSyncableEngineTasks(): List<DownloadTaskEntity> = dbIo {
+diff --git a/desktop/src/main/kotlin/com/yunx/app/data/db/Daos.kt b/desktop/src/main/kotlin/com/yunx/app/data/db/Daos.kt
+index 0590bc5..b0e153a 100644
+--- a/desktop/src/main/kotlin/com/yunx/app/data/db/Daos.kt
++++ b/desktop/src/main/kotlin/com/yunx/app/data/db/Daos.kt
+@@ -159,6 +159,16 @@ interface DownloadTaskDao {
+     suspend fun updateError(id: Long, errorMsg: String)
+     suspend fun complete(id: Long, status: Int, savePath: String, avgSpeed: Long = 0L)
+     suspend fun delete(id: Long)
++    /**
++     * 批量删除（「删除全部」/一次清掉上万条任务）。
++     * 一条 SQL 搞定，且只触发一次列表发射 —— 逐条 [delete] 在几千条规模下是 O(N²)。
++     */
++    suspend fun deleteMany(ids: Collection<Long>)
++    /**
++     * 批量改状态（「全部暂停」/「全部开始」）。
++     * 同样是一条 SQL + 一次发射，避免逐条 [updateStatus] 造成的重载风暴。
++     */
++    suspend fun updateStatusMany(ids: Collection<Long>, status: Int)
+     /** 记录外部下载引擎（Gopeed）的任务 ID；空串表示该任务回到内置下载器语义 */
+     suspend fun updateEngineTaskId(id: Long, engineTaskId: String)
+     /** 记录实验性直写的临时文件路径与模式（空路径/0 = 非直写） */
+diff --git a/desktop/src/main/kotlin/com/yunx/app/data/download/DownloadManager.kt b/desktop/src/main/kotlin/com/yunx/app/data/download/DownloadManager.kt
+index 39948fb..9e21498 100644
+--- a/desktop/src/main/kotlin/com/yunx/app/data/download/DownloadManager.kt
++++ b/desktop/src/main/kotlin/com/yunx/app/data/download/DownloadManager.kt
+@@ -314,6 +314,81 @@ private class InflightChunk(val start: Long, val size: Long, val worker: Int) {
+     val idleMs: Long get() = System.currentTimeMillis() - lastActivityAtMs
+ }
+ 
++/**
++ * 任务并发槽：真正的排队，替代旧的 300ms 忙等轮询。
++ *
++ * 旧实现（`while (activeDownloads >= max) delay(300)`）有两个致命问题：
++ * 1. **唤醒风暴**：排队 1 万个任务 → 每秒约 3.3 万次协程唤醒 + 3.3 万次原子读，
++ *    全部压在 `Dispatchers.Default` 上，与 UI 争抢 CPU；
++ * 2. **没有 FIFO**：谁先醒谁先跑，小文件会被反复插队。
++ *
++ * 现在的实现：取不到名额就挂起在 [CompletableDeferred] 上（零 CPU），
++ * 释放名额时在锁内把名额直接转交给队首等待者，严格先进先出，且暂停/取消不会漏掉名额。
++ */
++private class TaskSlotQueue(
++    /** 并发上限（设置里「最大同时下载数」，运行期可变） */
++    private val limitProvider: () -> Int
++) {
++    private val lock = Any()
++
++    /** 已占用的名额 */
++    private var inUse = 0
++
++    /** 排队中的等待者（先进先出） */
++    private val waiters = ArrayDeque<CompletableDeferred<Unit>>()
++
++    /** 当前真正在跑的任务数（「下载调试」页显示用） */
++    val activeCount: Int get() = synchronized(lock) { inUse }
++
++    /** 排队等名额的任务数 */
++    val waitingCount: Int get() = synchronized(lock) { waiters.size }
++
++    private fun limit(): Int = limitProvider().coerceAtLeast(1)
++
++    /** 取一个名额；无空位时挂起等待（协程被取消时会把自己从队列摘掉，名额不会丢） */
++    suspend fun acquire() {
++        val waiter: CompletableDeferred<Unit>? = synchronized(lock) {
++            if (inUse < limit()) {
++                inUse++
++                null
++            } else {
++                CompletableDeferred<Unit>().also { waiters.addLast(it) }
++            }
++        }
++        if (waiter == null) return
++        try {
++            // 释放方已在锁内把名额记到本等待者名下，醒来即可开工
++            waiter.await()
++        } catch (e: CancellationException) {
++            val handedOver = synchronized(lock) {
++                if (waiters.remove(waiter)) {
++                    false
++                } else {
++                    // 名额已经转交给本等待者（complete 之后才被取消）：立刻归还并转给下一位
++                    inUse--
++                    true
++                }
++            }
++            if (handedOver) release()
++            throw e
++        }
++    }
++
++    /** 归还名额，并把空位转交给队首等待者（唤醒一次，不再有轮询） */
++    fun release() {
++        synchronized(lock) {
++            if (inUse > 0) inUse--
++            val cap = limit()
++            while (inUse < cap && waiters.isNotEmpty()) {
++                val next = waiters.removeFirst()
++                if (!next.isActive) continue
++                inUse++
++                next.complete(Unit)
++            }
++        }
++    }
++}
++
+ /**
+  * 实验性多线程直写无法继续（服务器不支持 Range）：上层改用缓存分片模式重试。
+  * 不算一次失败重试，避免把任务的 retryCount 消耗掉。
+@@ -357,8 +432,15 @@ class DownloadManager(
+     private val credentialCipher: CredentialCipher = FileCredentialCipher()
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+ 
+-    /** 当前实际下载中的任务数（用于最大同时下载任务数限制） */
+-    private val activeDownloads = java.util.concurrent.atomic.AtomicInteger(0)
++    /** 任务并发槽：真正的排队（上限 = 设置里的「最大同时下载数」，运行期可变） */
++    private val taskSlots = TaskSlotQueue { concurrencyProvider() }
++
++    /**
++     * 真正**持有并发槽、正在下载**的任务（对比「只是排队等名额」的任务）。
++     * 批量暂停要靠它区分：正在下载的要等协程退出后按磁盘真实大小回写进度；
++     * 只是排队的直接取消协程即可（否则取消不彻底，暂停的任务还会自己开始下载）。
++     */
++    private val downloadingTaskIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+ 
+     /**
+      * 空间守卫：进行中任务的预期缓存体积（taskId → 文件总大小）。
+@@ -716,7 +798,7 @@ class DownloadManager(
+         return DownloadResourceDebug(
+             inflightCap = MAX_INFLIGHT_CHUNKS,
+             inflightUsed = MAX_INFLIGHT_CHUNKS - inflightLimiter.availablePermits,
+-            activeTasks = activeJobs.size,
++            activeTasks = taskSlots.activeCount,
+             heapUsed = rt.totalMemory() - rt.freeMemory(),
+             heapMax = rt.maxMemory(),
+             poolSize = pool.poolSize,
+@@ -1078,6 +1160,65 @@ class DownloadManager(
+         }
+     }
+ 
++    /**
++     * 批量暂停（下载页「全部暂停」）：一次性暂停成百上千条任务。
++     *
++     * 逐条调 [pause] 的代价是每条任务一次 `dao.updateStatus` —— 旧实现每次都要重读全表，
++     * 3000 条就是 3000 次全表扫描（界面会卡死几十秒）。这里分两拨：
++     * - 真在跑的任务（有活协程，数量 ≤ 并发上限，通常个位数）沿用原逻辑，
++     *   保留「等协程退出后按磁盘真实大小回写进度」；
++     * - 只是排队/待跑的任务：一次批量 SQL 落库。
++     */
++    fun pauseMany(ids: Collection<Long>) {
++        if (ids.isEmpty()) return
++        val running = ArrayList<Long>(ids.size.coerceAtMost(32))
++        val idle = ArrayList<Long>(ids.size)
++        ids.forEach { id ->
++            val engineId = engineTaskIds[id]
++            if (engineId != null) {
++                pauseEngineTask(id, engineId)
++                return@forEach
++            }
++            downloader.cancelCalls(id)
++            _stats.update { it - id }
++            val deferred = synchronized(jobsLock) { activeJobs.remove(id) }
++            when {
++                deferred == null -> idle += id
++                id in downloadingTaskIds -> {
++                    // 真在下载（持有并发槽）：等协程退出后按磁盘真实大小回写进度（条数 ≤ 并发上限）
++                    running += id
++                    DownloadDebugLog.record(id, "暂停", "用户批量暂停，分片文件保留")
++                    scope.launch {
++                        runCatching { deferred.await().cancelAndJoin() }
++                        val real = chunkDirOf(id).listFiles()
++                            ?.filter {
++                                it.name.startsWith("part_") ||
++                                    (it.name.startsWith("seg_") && it.name.endsWith(".part"))
++                            }
++                            ?.sumOf { it.length() } ?: 0L
++                        val t = dao.get(id)
++                        if (t != null && real > t.downloadedSize) {
++                            dao.updateProgress(id, DownloadTaskEntity.STATUS_PAUSED, real, t.totalSize)
++                        } else {
++                            dao.updateStatus(id, DownloadTaskEntity.STATUS_PAUSED)
++                        }
++                    }
++                }
++                else -> {
++                    // ★ 只是排在队里等名额：必须**取消协程**，否则它迟早拿到名额、把已暂停的任务下起来。
++                    //   取消后 acquire() 会把自己从等待队列摘掉，名额不会漏。
++                    runCatching { deferred.getCompleted().cancel() }.onFailure {
++                        scope.launch { runCatching { deferred.await().cancel() } }
++                    }
++                    idle += id
++                }
++            }
++        }
++        if (idle.isNotEmpty()) {
++            scope.launch { dao.updateStatusMany(idle, DownloadTaskEntity.STATUS_PAUSED) }
++        }
++    }
++
+     /**
+      * 删除任务：取消下载 + 清 DB + 清 part 文件。
+      * @param deleteLocal 同时删除已保存到本地的文件（savePath）
+@@ -1134,6 +1275,65 @@ class DownloadManager(
+         }
+     }
+ 
++    /**
++     * 批量删除（下载页「删除全部」）：一条 DELETE + 一次列表发射。
++     *
++     * 磁盘清理（分片目录 / 已保存文件）仍在 IO 线程逐条做，但不再「每条任务写一次库」——
++     * 旧实现逐条 [remove] 在几千条规模下是 O(N²) 的全表重载。
++     */
++    suspend fun removeMany(ids: Collection<Long>, deleteLocal: Boolean = false) {
++        if (ids.isEmpty()) return
++        val idSet = ids.toHashSet()
++        val engineIds = ArrayList<String>(4)
++        val callbacks = ArrayList<suspend () -> Unit>(4)
++        val jobs = ArrayList<CompletableDeferred<Job>>(4)
++        // ① 内存态与非阻塞清理（全是 O(1) 操作）
++        idSet.forEach { id ->
++            engineTaskIds.remove(id)?.let { engineIds += it }
++            engineDestPaths.remove(id)
++            finishEngineTask(id)
++            downloader.cancelCalls(id)
++            _stats.update { it - id }
++            taskHeaders.remove(id)
++            taskMergeAudioHeaders.remove(id)
++            taskAltSources.remove(id)
++            taskFallbackUrls.remove(id)
++            taskLocks.remove(id)
++            clearSpacePlan(id)
++            clearDirectState(id)
++            taskCallbacks.remove(id)?.let { callbacks += it }
++            DownloadDebugLog.drop(id)
++        }
++        synchronized(jobsLock) {
++            idSet.forEach { id -> activeJobs.remove(id)?.let { jobs += it } }
++        }
++        // ② 等协程退出（保证没有残留写入 / fd 占用）→ 清磁盘 → 一次批量删库 → 回调
++        val rows = dao.listAll().filter { it.id in idSet }
++        scope.launch {
++            jobs.forEach { runCatching { it.await().cancelAndJoin() } }
++            withContext(Dispatchers.IO) {
++                rows.forEach { t ->
++                    runCatching { chunkDirOf(t.id).deleteRecursively() }
++                    if (deleteLocal && t.savePath.isNotBlank()) {
++                        runCatching { DownloadSaver.delete(t.savePath) }
++                    }
++                    runCatching { DownloadSaver.deleteDirectPart(t.directPart) }
++                }
++            }
++            DiagnosticLog.dbOp("download_task", "delete", rowsOf = { -1 }) { dao.deleteMany(idSet) }
++            DiagnosticLog.event(
++                DiagnosticLog.OPERATION, "download_remove",
++                "count=${idSet.size} deleteLocal=$deleteLocal"
++            )
++            engineIds.forEach { engineId ->
++                runCatching { withContext(Dispatchers.IO) { GopeedEngine.deleteTask(engineId) } }
++                    .onFailure { Log.w(TAG, "通知引擎删除任务失败：${it.message}") }
++            }
++            // 云盘转存清理等回调：失败不阻断
++            callbacks.forEach { cb -> runCatching { cb() } }
++        }
++    }
++
+     // ---------- 外部 Gopeed 引擎（exe 子进程 + 本地 HTTP API）----------
+ 
+     /** 本地任务 id → 引擎任务 ID（内存快判；持久化真源是 download_task.engineTaskId） */
+@@ -1180,6 +1380,13 @@ class DownloadManager(
+     init {
+         // 进程重启后接管历史引擎任务：必要时拉起引擎并继续轮询进度
+         scope.launch { ensureEngineSync() }
++        // 本地性能补丁标记：诊断日志里可确认当前跑的是补丁包（任务表增量更新 / 真队列 / 扁平惰性列表）
++        runCatching {
++            DiagnosticLog.event(
++                DiagnosticLog.OPERATION, "perf_patch_active",
++                "taskList=incremental queue=slotQueue downloadScreen=flattened"
++            )
++        }
+         // 启动缓存治理（Issue #17）：
+         // ① 上次进程没跑完的「下载中 / 等待中」任务实际已停止，改回暂停，避免 UI 一直显示下载中；
+         // ② 清掉已完成任务、已删除任务残留的分片目录与合并临时文件 —— 旧实现只在成功回调里删，
+@@ -1757,14 +1964,6 @@ class DownloadManager(
+         }
+     }
+ 
+-    /** 等待并发许可：当前下载任务数 >= 上限时轮询等待（暂停/取消可退出等待） */
+-    private suspend fun awaitConcurrencySlot() {
+-        val max = concurrencyProvider().coerceAtLeast(1)
+-        while (isTaskActive() && activeDownloads.get() >= max) {
+-            delay(300)
+-        }
+-    }
+-
+     /**
+      * 执行任务并支持失败自动重试（断点续传，part 文件保留）。
+      * 同时负责「最大同时下载任务数」并发许可的获取/释放。
+@@ -1773,11 +1972,11 @@ class DownloadManager(
+         var attempts = 0
+         val maxRetries = retryCountProvider().coerceIn(0, 10)
+         while (true) {
+-            // 并发许可：排队等待，直到有空闲下载槽位（或任务被暂停/取消）
+-            awaitConcurrencySlot()
+-            if (!isTaskActive()) return
+-            activeDownloads.incrementAndGet()
++            // 并发许可：真正的排队（挂起等待空位，不轮询）；暂停/删除会取消本协程
++            taskSlots.acquire()
++            downloadingTaskIds += id
+             try {
++                if (!isTaskActive()) return
+                 try {
+                     runTask(id, headers)
+                     return
+@@ -1805,7 +2004,8 @@ class DownloadManager(
+                     }
+                 }
+             } finally {
+-                activeDownloads.decrementAndGet()
++                downloadingTaskIds -= id
++                taskSlots.release()
+             }
+         }
+     }
+diff --git a/desktop/src/main/kotlin/com/yunx/app/ui/MainScreen.kt b/desktop/src/main/kotlin/com/yunx/app/ui/MainScreen.kt
+index 8b8b595..98b6ee2 100644
+--- a/desktop/src/main/kotlin/com/yunx/app/ui/MainScreen.kt
++++ b/desktop/src/main/kotlin/com/yunx/app/ui/MainScreen.kt
+@@ -192,6 +192,7 @@ import com.yunx.app.ui.viewmodel.UCCoudViewModel
+ import com.yunx.app.ui.viewmodel.XunleiAccountViewModel
+ import com.yunx.app.ui.viewmodel.XunleiCloudViewModel
+ import com.yunx.app.util.Log
++import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.launch
+ 
+@@ -216,7 +217,18 @@ fun MainScreen(
+     /** 最小化到系统托盘（由 Main.kt 实现，含关闭请求抑制） */
+     onMinimizeToTray: () -> Unit = {}
+ ) {
+-    var currentTab by rememberSaveable { mutableStateOf(MainTab.Resolve) }
++    // 调试/压测用：YUNX_START_TAB=download|drive|settings 可指定启动落在哪个页
++    // （默认行为不变，仍是「解析」）。上万条任务的压测脚本靠它直接进下载页，免掉 UI 点击。
++    var currentTab by rememberSaveable {
++        mutableStateOf(
++            when (System.getenv("YUNX_START_TAB")?.lowercase()) {
++                "download", "下载" -> MainTab.Download
++                "drive", "网盘" -> MainTab.Drive
++                "settings", "设置" -> MainTab.Settings
++                else -> MainTab.Resolve
++            }
++        )
++    }
+     // 网盘页：四宫格 / 列表布局切换
+     var driveGridMode by rememberSaveable { mutableStateOf(false) }
+     var showQuarkLogin by rememberSaveable { mutableStateOf(false) }
+@@ -354,7 +366,19 @@ fun MainScreen(
+     }
+ 
+     // ===== 关闭行为处理 =====
+-    val tasks by downloadManager.tasks.collectAsState(initial = emptyList())
++    // ★ 只订阅「有没有任务在跑」这一个布尔值，**不要**把整张任务表收进根组合：
++    //   旧实现是 `downloadManager.tasks.collectAsState()`，任务表每变一次（进度刷新/入队/完成）
++    //   整个主界面根节点都要重组一遍 —— 几千条任务时这是全局卡顿的主要放大器。
++    val hasActiveTasks by remember(downloadManager) {
++        downloadManager.tasks
++            .map { list ->
++                list.any {
++                    it.status == DownloadTaskEntity.STATUS_DOWNLOADING ||
++                        it.status == DownloadTaskEntity.STATUS_PENDING
++                }
++            }
++            .distinctUntilChanged()
++    }.collectAsState(initial = false)
+     // 关闭确认弹窗状态
+     var showCloseDialog by remember { mutableStateOf(false) }
+     var closeDialogHasDownloads by remember { mutableStateOf(false) }
+@@ -370,9 +394,7 @@ fun MainScreen(
+     LaunchedEffect(closeRequested) {
+         if (!closeRequested) return@LaunchedEffect
+         val behavior = settings.closeBehavior
+-        val hasActiveDownloads = tasks.any {
+-            it.status == DownloadTaskEntity.STATUS_DOWNLOADING || it.status == DownloadTaskEntity.STATUS_PENDING
+-        }
++        val hasActiveDownloads = hasActiveTasks
+         when (behavior) {
+             SettingsRepository.CLOSE_BEHAVIOR_TRAY -> {
+                 minimizeToTray()
+diff --git a/desktop/src/main/kotlin/com/yunx/app/ui/screens/AboutScreen.kt b/desktop/src/main/kotlin/com/yunx/app/ui/screens/AboutScreen.kt
+index 8be5a1c..e1cb32d 100644
+--- a/desktop/src/main/kotlin/com/yunx/app/ui/screens/AboutScreen.kt
++++ b/desktop/src/main/kotlin/com/yunx/app/ui/screens/AboutScreen.kt
+@@ -185,7 +185,8 @@ private fun AppHeader(versionName: String) {
+         Spacer(modifier = Modifier.height(4.dp))
+         Row(verticalAlignment = Alignment.CenterVertically) {
+             Text(
+-                text = "YunX-Desktop · v$versionName",
++                // ★ 本地补丁标记：用于一眼确认「跑的是打了性能补丁的 jar」，不是官方原包装。
++                text = "YunX-Desktop · v$versionName · 本地性能补丁",
+                 style = MaterialTheme.typography.bodyMedium,
+                 color = MaterialTheme.colorScheme.onSurfaceVariant
+             )
+diff --git a/desktop/src/main/kotlin/com/yunx/app/ui/screens/DownloadScreen.kt b/desktop/src/main/kotlin/com/yunx/app/ui/screens/DownloadScreen.kt
+index aac3dbd..644eb06 100644
+--- a/desktop/src/main/kotlin/com/yunx/app/ui/screens/DownloadScreen.kt
++++ b/desktop/src/main/kotlin/com/yunx/app/ui/screens/DownloadScreen.kt
+@@ -69,11 +69,15 @@ import androidx.compose.material3.TopAppBarScrollBehavior
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateListOf
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.saveable.listSaver
+ import androidx.compose.runtime.saveable.rememberSaveable
+ import androidx.compose.runtime.setValue
++import androidx.compose.runtime.snapshots.SnapshotStateList
++import androidx.compose.runtime.toMutableStateList
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.semantics.Role
+@@ -106,6 +110,13 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ 
++/**
++ * 文件夹组默认展开的规模上限：超过这个文件数的组默认收起。
++ * 展开后虽然已经是虚拟化的（只组合可视行），但一次拉出上万行的 item 会把滚动条压成一条线、
++ * 让用户几乎滚不到别的组 —— 大组先收起更实用。
++ */
++private const val GROUP_EXPAND_LIMIT = 400
++
+ /**
+  * 下载页：任务列表（分片多线程下载 / 断点续传）、进度展示、暂停/继续/删除/打开。
+  */
+@@ -122,6 +133,15 @@ fun DownloadScreen(
+     val shutdownWhenDone by viewModel.shutdownWhenDone.collectAsState()
+     // 任务列表滚动状态（右侧滚动条 / 定位用）
+     val listState = rememberLazyListState()
++    // 文件夹组的展开/收起状态：记录「与默认值相反」的组（大组默认收起）。
++    // ★ 用 rememberSaveable：切到别的 Tab 再切回来时下载页组合会被重建，remember 会让状态复位
++    //   —— 几千条任务的组一旦复位成展开，用户又要吃一次全量布局。
++    val toggledGroups = rememberSaveable(
++        saver = listSaver<SnapshotStateList<String>, String>(
++            save = { it.toList() },
++            restore = { it.toMutableStateList() }
++        )
++    ) { mutableStateListOf<String>() }
+     val settingsRepo = remember { SettingsRepository() }
+     var showAddDialog by remember { mutableStateOf(false) }
+     var pendingDelete by remember { mutableStateOf<DownloadTaskEntity?>(null) }
+@@ -182,6 +202,36 @@ fun DownloadScreen(
+                         .weight(1f)
+                         .fillMaxWidth()
+                 ) {
++                    // ★ 分组数据只在「任务集合」变化时重算（remember）。
++                    //   旧实现把这些 filter/groupBy/sortedBy 直接写在 LazyColumn 的 item-provider 里，
++                    //   而 item-provider 每次重组都会重跑；下载中每秒有十几次 stats 发射，
++                    //   几千～上万条任务时这里每秒要做几十万次分组键推导（含 File.absolutePath / os.name）。
++                    val globalSaveRoot = remember(tasks, settingsRepo.downloadDirUri) {
++                        DownloadSaver.resolveSaveDir(settingsRepo.downloadDirUri).absolutePath
++                    }
++                    // 根目录任务（无相对路径）单独显示；下载失败的排到最上方（其余保持原有顺序）
++                    val rootTasks = remember(tasks) {
++                        tasks.filter { !it.fileName.contains('/') }
++                            .sortedBy { if (it.status == DownloadTaskEntity.STATUS_FAILED) 0 else 1 }
++                    }
++                    // 文件夹下载任务：按「保存根目录 + 顶级目录」分组。
++                    // 只看文件夹名会把“同一个文件夹下载到两个不同位置”的任务错误合并，
++                    // 展开后每个文件出现两条记录；Gopeed/内置下载器共用这套分组。
++                    // 组内子任务也在这里一次排好（失败置顶），不给每次重组留 O(n log n)。
++                    val folderGroups = remember(tasks, globalSaveRoot) {
++                        tasks.filter { it.fileName.contains('/') }
++                            .groupBy { DownloadGrouping.groupKey(it, globalSaveRoot) }
++                            .entries
++                            .map { entry ->
++                                entry.key to entry.value.sortedBy {
++                                    if (it.status == DownloadTaskEntity.STATUS_FAILED) 0 else 1
++                                }
++                            }
++                            .sortedBy { entry ->
++                                if (entry.second.any { it.status == DownloadTaskEntity.STATUS_FAILED }) 0 else 1
++                            }
++                    }
++
+                     LazyColumn(
+                         state = listState,
+                         modifier = Modifier
+@@ -190,21 +240,6 @@ fun DownloadScreen(
+                         contentPadding = PaddingValues(start = 16.dp, end = 24.dp, top = 8.dp, bottom = 96.dp),
+                         verticalArrangement = Arrangement.spacedBy(10.dp)
+                     ) {
+-                        // 根目录任务（无相对路径）单独显示；下载失败的排到最上方（其余保持原有顺序）
+-                        val rootTasks = tasks.filter { !it.fileName.contains('/') }
+-                            .sortedBy { if (it.status == DownloadTaskEntity.STATUS_FAILED) 0 else 1 }
+-                        // 文件夹下载任务：按「保存根目录 + 顶级目录」分组。
+-                        // 只看文件夹名会把“同一个文件夹下载到两个不同位置”的任务错误合并，
+-                        // 展开后每个文件出现两条记录；Gopeed/内置下载器共用这套分组。
+-                        val globalSaveRoot = DownloadSaver.resolveSaveDir(settingsRepo.downloadDirUri).absolutePath
+-                        // 含下载失败子任务的文件夹整体排到最上方（其余保持原有分组顺序）
+-                        val folderGroups = tasks.filter { it.fileName.contains('/') }
+-                            .groupBy { DownloadGrouping.groupKey(it, globalSaveRoot) }
+-                            .entries
+-                            .sortedBy { entry ->
+-                                if (entry.value.any { it.status == DownloadTaskEntity.STATUS_FAILED }) 0 else 1
+-                            }
+-
+                         items(rootTasks, key = { it.id }) { task ->
+                             DownloadTaskCard(
+                                 modifier = animateItemIfAllowed(),
+@@ -218,23 +253,43 @@ fun DownloadScreen(
+                             )
+                         }
+ 
++                        // ★ 文件夹组 = **表头一条 item + 子任务各自一条 item**。
++                        //   旧实现把整组子任务塞进同一个 item 里用普通 Column 渲染，
++                        //   LazyColumn 的虚拟化对子项完全失效 —— 几千个文件的文件夹会一次性组合几千行。
+                         folderGroups.forEach { (groupKey, groupTasks) ->
+                             val folder = groupKey.second
+-                            val saveRoot = DownloadGrouping.folderSaveRoot(groupTasks.first(), globalSaveRoot)
+-                            item(key = "folder_${groupKey.first}_$folder") {
+-                                FolderDownloadGroup(
++                            val groupId = "folder_${groupKey.first}_$folder"
++                            // 默认「小组展开、大组收起」：几千行的组先收起来，用户点开时也只渲染可视行
++                            val defaultExpanded = groupTasks.size <= GROUP_EXPAND_LIMIT
++                            val expanded = if (groupId in toggledGroups) !defaultExpanded else defaultExpanded
++                            item(key = groupId) {
++                                FolderDownloadGroupHeader(
+                                     modifier = animateItemIfAllowed(),
+                                     folder = folder,
+-                                    saveRoot = saveRoot,
++                                    globalSaveRoot = globalSaveRoot,
+                                     tasks = groupTasks,
+                                     stats = stats,
+-                                    onPause = { viewModel.pause(it) },
+-                                    onResume = { viewModel.resume(it) },
+-                                    onRemove = { pendingDelete = it },
+-                                    onRedownload = { viewModel.redownload(it) },
+-                                    onDebug = openDebug
++                                    expanded = expanded,
++                                    onToggleExpanded = {
++                                        if (groupId in toggledGroups) toggledGroups.remove(groupId)
++                                        else toggledGroups.add(groupId)
++                                    }
+                                 )
+                             }
++                            if (expanded) {
++                                items(groupTasks, key = { "sub_${it.id}" }) { task ->
++                                    DownloadSubTaskRow(
++                                        modifier = Modifier.padding(start = 14.dp),
++                                        task = task,
++                                        stats = stats[task.id],
++                                        onPause = { viewModel.pause(task.id) },
++                                        onResume = { viewModel.resume(task.id) },
++                                        onRemove = { pendingDelete = task },
++                                        onRedownload = { viewModel.redownload(task) },
++                                        onDebug = openDebug?.let { cb -> { cb(task) } }
++                                    )
++                                }
++                            }
+                         }
+                     }
+                     VerticalScrollbar(
+@@ -552,36 +607,65 @@ private fun EmptyDownloadState(modifier: Modifier = Modifier) {
+     }
+ }
+ 
++/** 文件夹组表头用的聚合值（按组 remember 一次，避免每次重组都 O(组大小) 扫一遍） */
++private data class FolderAggregate(
++    val total: Int,
++    val completed: Int,
++    val totalSize: Long,
++    val downloaded: Long,
++    /** 组内任务 id（判定「合并中」时做 O(1) 命中） */
++    val ids: Set<Long>
++) {
++    val fraction: Float
++        get() = if (totalSize > 0) (downloaded.toFloat() / totalSize).coerceIn(0f, 1f) else 0f
++    val done: Boolean get() = total > 0 && completed == total
++
++    companion object {
++        fun of(tasks: List<DownloadTaskEntity>): FolderAggregate {
++            val totalSize = tasks.sumOf { it.totalSize }
++            return FolderAggregate(
++                total = tasks.size,
++                completed = tasks.count { it.status == DownloadTaskEntity.STATUS_COMPLETED },
++                totalSize = totalSize,
++                // 聚合显示钳制：任何单项竞态残留都不会让"已下载 > 总大小"
++                downloaded = minOf(tasks.sumOf { it.downloadedSize }, totalSize),
++                ids = tasks.mapTo(HashSet(tasks.size.coerceAtLeast(1))) { it.id }
++            )
++        }
++    }
++}
++
+ /**
+- * 文件夹下载组：同一「顶级目录」下的所有任务合并为一个可展开卡片。
+- * 收起时显示文件夹名 + 统计 + 总体进度；展开后显示子任务（含子文件夹内文件）紧凑列表。
++ * 文件夹下载组的**表头**：同一「顶级目录」下的任务汇总成一张可折叠卡片。
++ *
++ * ★ 子任务**不在这里渲染** —— 由调用方作为平级的 LazyColumn item 输出（见 DownloadScreen）。
++ *   旧实现把整组塞进**一个** item 里、再用普通 Column + forEach 渲染子项，
++ *   LazyColumn 的虚拟化对子项完全失效：下载一个含几千个文件的文件夹会一次性组合几千行
++ *   （每行 20+ 节点），首帧就是几秒的卡死，之后每次重组还要再排一遍。
+  */
+ @Composable
+-private fun FolderDownloadGroup(
++private fun FolderDownloadGroupHeader(
+     modifier: Modifier = Modifier,
+     folder: String,
+-    /** 该组的保存根目录（用于区分“同名文件夹下载到不同位置”的多组任务） */
+-    saveRoot: String,
++    /** 当前全局保存根目录（分组键的一部分） */
++    globalSaveRoot: String,
++    /** 本组任务（已按「失败置顶」排好序） */
+     tasks: List<DownloadTaskEntity>,
++    /** 实时统计（只含正在跑的任务，最多几条） */
+     stats: Map<Long, DownloadStats>,
+-    onPause: (Long) -> Unit,
+-    onResume: (Long) -> Unit,
+-    onRemove: (DownloadTaskEntity) -> Unit,
+-    onRedownload: (DownloadTaskEntity) -> Unit,
+-    onDebug: ((DownloadTaskEntity) -> Unit)? = null
++    expanded: Boolean,
++    onToggleExpanded: () -> Unit
+ ) {
+-    // ★ 用 rememberSaveable（而非 remember）：切到别的 Tab 再切回来时，
+-    //   下载页组合会被重建，remember 会让折叠状态复位成「展开」。
+-    // ★ 折叠状态按「保存根目录 + 文件夹名」分别保存：同名文件夹下载到不同位置时互不影响
+-    var expanded by rememberSaveable(folder, saveRoot) { mutableStateOf(true) }
+-    val completed = tasks.count { it.status == DownloadTaskEntity.STATUS_COMPLETED }
+-    val totalSize = tasks.sumOf { it.totalSize }
+-    // 聚合显示钳制：任何单项竞态残留都不会让"已下载 > 总大小"
+-    val downloaded = minOf(tasks.sumOf { it.downloadedSize }, totalSize)
+-    val fraction = if (totalSize > 0) {
+-        (downloaded.toFloat() / totalSize).coerceIn(0f, 1f)
+-    } else 0f
+-    val done = completed == tasks.size
++    // ★ 聚合值只在「本组任务集合」变化时重算：stats 每秒要变十几次，
++    //   绝不能让它触发 O(组大小) 的扫描（几千个文件的组就是每秒几十万次加法）。
++    val saveRoot = remember(tasks, globalSaveRoot) {
++        DownloadGrouping.folderSaveRoot(tasks.first(), globalSaveRoot)
++    }
++    val aggregate = remember(tasks) { FolderAggregate.of(tasks) }
++    // 「合并中」只在少量活动任务里找：O(stats) = O(并发数)
++    val merging = stats.any { (id, st) -> st.mergePercent >= 0 && id in aggregate.ids }
++    val fraction = aggregate.fraction
++    val done = aggregate.done
+ 
+     Card(
+         modifier = modifier.fillMaxWidth(),
+@@ -595,7 +679,7 @@ private fun FolderDownloadGroup(
+             Row(
+                 modifier = Modifier
+                     .fillMaxWidth()
+-                    .clickable { expanded = !expanded }
++                    .clickable { onToggleExpanded() }
+                     .padding(start = 14.dp, end = 10.dp, top = 12.dp, bottom = 10.dp),
+                 verticalAlignment = Alignment.CenterVertically
+             ) {
+@@ -625,7 +709,8 @@ private fun FolderDownloadGroup(
+                     )
+                     Spacer(modifier = Modifier.height(2.dp))
+                     Text(
+-                        text = "${completed}/${tasks.size} 个文件 · ${formatSize(downloaded)} / ${formatSize(totalSize)}",
++                        text = "${aggregate.completed}/${aggregate.total} 个文件 · " +
++                            "${formatSize(aggregate.downloaded)} / ${formatSize(aggregate.totalSize)}",
+                         style = MaterialTheme.typography.bodySmall,
+                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                     )
+@@ -639,7 +724,6 @@ private fun FolderDownloadGroup(
+                     )
+                 }
+                 // 总体进度徽标（有子任务在合并分片时显示"合并中"，避免停在 100% 像卡死）
+-                val merging = tasks.any { (stats[it.id]?.mergePercent ?: -1) >= 0 }
+                 Surface(
+                     shape = RoundedCornerShape(50),
+                     color = if (done) {
+@@ -672,45 +756,18 @@ private fun FolderDownloadGroup(
+                 )
+             }
+ 
+-            // 展开区：总体进度条 + 子任务紧凑列表
+-            AnimatedVisibility(
+-                visible = expanded,
+-                enter = fadeIn(tween(200)) + expandVertically(tween(200), expandFrom = Alignment.Top),
+-                exit = fadeOut(tween(150)) + shrinkVertically(tween(150), shrinkTowards = Alignment.Top)
+-            ) {
+-                Column {
+-                    // 总体进度条（已完成时隐藏）
+-                    if (!done) {
+-                        LinearProgressIndicator(
+-                            progress = { fraction },
+-                            modifier = Modifier
+-                                .fillMaxWidth()
+-                                .padding(horizontal = 14.dp),
+-                            color = MaterialTheme.colorScheme.primary,
+-                            trackColor = MaterialTheme.colorScheme.surfaceContainerHighest
+-                        )
+-                    }
+-                    // 子任务列表（紧凑行，含子文件夹内文件）；下载失败的子任务置顶（其余保持原有顺序）
+-                    val orderedTasks = tasks.sortedBy {
+-                        if (it.status == DownloadTaskEntity.STATUS_FAILED) 0 else 1
+-                    }
+-                    Column(
+-                        modifier = Modifier.padding(10.dp),
+-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+-                    ) {
+-                        orderedTasks.forEach { task ->
+-                            DownloadSubTaskRow(
+-                                task = task,
+-                                stats = stats[task.id],
+-                                onPause = { onPause(task.id) },
+-                                onResume = { onResume(task.id) },
+-                                onRemove = { onRemove(task) },
+-                                onRedownload = { onRedownload(task) },
+-                                onDebug = onDebug?.let { cb -> { cb(task) } }
+-                            )
+-                        }
+-                    }
+-                }
++            // 总体进度条（已完成时隐藏）。
++            // ★ 子任务**不在这里渲染**：它们由调用方作为平级的 LazyColumn item 输出，
++            //   这样几千个文件的组也只组合可视区域里的那几行（旧实现在这里 forEach 全组）。
++            if (!done) {
++                LinearProgressIndicator(
++                    progress = { fraction },
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .padding(start = 14.dp, end = 14.dp, bottom = 10.dp),
++                    color = MaterialTheme.colorScheme.primary,
++                    trackColor = MaterialTheme.colorScheme.surfaceContainerHighest
++                )
+             }
+         }
+     }
+@@ -722,6 +779,7 @@ private fun FolderDownloadGroup(
+  */
+ @Composable
+ private fun DownloadSubTaskRow(
++    modifier: Modifier = Modifier,
+     task: DownloadTaskEntity,
+     stats: DownloadStats?,
+     onPause: () -> Unit,
+@@ -748,7 +806,7 @@ private fun DownloadSubTaskRow(
+     var showMenu by remember { mutableStateOf(false) }
+ 
+     Surface(
+-        modifier = Modifier
++        modifier = modifier
+             .fillMaxWidth()
+             .clip(RoundedCornerShape(14.dp))
+             .clickable(onClick = {})
+diff --git a/desktop/src/main/kotlin/com/yunx/app/ui/viewmodel/DownloadViewModel.kt b/desktop/src/main/kotlin/com/yunx/app/ui/viewmodel/DownloadViewModel.kt
+index 3f540e0..c8d2dea 100644
+--- a/desktop/src/main/kotlin/com/yunx/app/ui/viewmodel/DownloadViewModel.kt
++++ b/desktop/src/main/kotlin/com/yunx/app/ui/viewmodel/DownloadViewModel.kt
+@@ -72,10 +72,12 @@ class DownloadViewModel(private val manager: DownloadManager) : ViewModel() {
+ 
+     /** 全部暂停：暂停所有正在下载（含等待中）的任务 */
+     fun pauseAll() {
+-        tasks.value.filter {
++        val ids = tasks.value.filter {
+             it.status == DownloadTaskEntity.STATUS_DOWNLOADING ||
+                 it.status == DownloadTaskEntity.STATUS_PENDING
+-        }.forEach { manager.pause(it.id) }
++        }.map { it.id }
++        // ★ 批量入口：几千条任务逐条 pause 会各写一次库（旧实现每次重载全表）
++        manager.pauseMany(ids)
+     }
+ 
+     /** 全部开始：恢复所有已暂停/失败的任务（断点续传） */
+@@ -88,7 +90,9 @@ class DownloadViewModel(private val manager: DownloadManager) : ViewModel() {
+ 
+     /** 删除全部任务（可同时删除已保存到本地的文件） */
+     fun removeAll(deleteLocal: Boolean = false) {
+-        tasks.value.toList().forEach { manager.remove(it.id, deleteLocal) }
++        val ids = tasks.value.map { it.id }
++        // ★ 批量删除：一条 DELETE + 一次列表发射（旧实现逐条 delete，O(N²)）
++        viewModelScope.launch { manager.removeMany(ids, deleteLocal) }
+     }
+ 
+     // ---------- 下载完成后关机 ----------
